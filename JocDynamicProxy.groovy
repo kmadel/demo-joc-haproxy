@@ -3,118 +3,157 @@
 import org.apache.commons.io.FileUtils
 import org.apache.commons.io.filefilter.NameFileFilter
 import org.apache.commons.io.filefilter.TrueFileFilter
+import groovy.transform.EqualsAndHashCode
+import groovy.transform.ToString
 
 NEWLINE = System.getProperty("line.separator")
 JENKINS_OC_HOME = "/mnt/var/lib/jenkins-oc"
-CLIENT_MASTERS = [:]
+HA_PROXY_CFG = "/etc/haproxy/haproxy.cfg"
+OLD_JENKINS_INSTANCES = [] as Set
 
 run(args)
 
-def run(jocServers){
-	if(jocServers[0] == null){
+def run(servers){
+	if(servers == null){
 		throw new Exception("Enter JOC backends as Groovy args.")
 	}
+	JenkinsInstance joc = new JenkinsInstance(name: "joc", jenkinsHome: JENKINS_OC_HOME, servers: servers, httpPort: 80)
 	while(true){
-		monitor(jocServers.toList())
-		println("JocDynamicProxy: polling")
-		Thread.sleep(5000);
+		monitor(joc)
+		Thread.sleep(5000)
+		// new Timer().schedule({ monitor(joc) } as TimerTask, 1000, 5000)
 	}
 }
 
-def monitor(List jocServers){
+def monitor(JenkinsInstance joc){
+	println("JocDynamicProxy: polling")
+
 	// grab all connected client masters from joc
-	File jocHome = new File("${JENKINS_OC_HOME}/jobs")
+	File jocJobs = new File("${joc.jenkinsHome}/jobs")
 	FileFilter configFilter = new NameFileFilter("config.xml")
-	Collection<File> configs = FileUtils.listFiles(jocHome, configFilter, TrueFileFilter.INSTANCE)
+	Collection<File> configs = FileUtils.listFiles(jocJobs, configFilter, TrueFileFilter.INSTANCE)
 
-	def newClientMasters = [:]
+	//create a JenkinsIntance for each
+	def jenkinsInstances = [joc] as Set
 	configs.each{ file ->
-	        def config = new XmlParser().parse(file)
-	        if (config.name() == 'com.cloudbees.opscenter.server.model.ClientMaster'){
-	                newClientMasters[config.encodedName.text()] = config.description.text().tokenize()
-	        }
+        def config = new XmlParser().parse(file)
+        if (config.name() == 'com.cloudbees.opscenter.server.model.ClientMaster'){
+        	def clientMaster = new JenkinsInstance(name: config.encodedName.text(), servers: config.description.text().tokenize())
+            jenkinsInstances.add(clientMaster)
+        }
 	}
 
-	//dont reload / restart unless there are new masters
-	if(newClientMasters != CLIENT_MASTERS){
-		println "Polling found new client masters"
+	//dont reload unless there are new masters
+	if(!OLD_JENKINS_INSTANCES.equals(jenkinsInstances)){
+		println "JocDynamicProxy: detected jenkins instance change"
 		// update haproxy.cfg
-		File newCfg = new File("/etc/haproxy/haproxy-new.cfg")
+		updateAndReload(jenkinsInstances)
 
-		newCfg.withWriter{ writer ->
-			writer.write(template(aclsFromClientMasters(newClientMasters), jocServers))
-			writer.write(backendsFromClientMasters(newClientMasters))
+		// now determine jnlp ports
+		jenkinsInstances.each{
+			def port = getCliPort("http://localhost/" + it.name + "/") //TODO localhost?
+			it.jnlpPort = port
 		}
 
-		new File("/etc/haproxy/haproxy.cfg").renameTo("/etc/haproxy/haproxy.cfg.bkup")
-		newCfg.renameTo("/etc/haproxy/haproxy.cfg")	
-
-		restart()
-
-		// now determine jnlp port
-		newClientMasters.each{
-			def port = getCliPort("http://proxy.jenkins-haproxy.dev.beedemo.io/" + it.key + "/");
-			println("CLI Port: ${port}") //TODO need to retrieve result of execute from groovy
-		}
-
+		updateAndReload(jenkinsInstances)
 	}
-	CLIENT_MASTERS = newClientMasters
+	OLD_JENKINS_INSTANCES = jenkinsInstances
 }
 
+def updateAndReload(jenkinsInstances){
+	File newCfg = new File("${HA_PROXY_CFG}.new")
 
+	newCfg.withWriter{ writer ->
+		writer.write(template())
+		writer.write(listen("web", "http", jenkinsInstances))
+		writer.write(listen("jnlp", "tcp", jenkinsInstances))
+	}
 
-// functions
+	new File("{HA_PROXY_CFG}").renameTo("${HA_PROXY_CFG}.bkup")
+	newCfg.renameTo("${HA_PROXY_CFG}")	
 
-// reload haproxy.cfg (safe restart)
-def restart(){
-	// """haproxy -f /etc/haproxy/haproxy.cfg -p /var/run/haproxy.pid -sf \$(cat /var/run/haproxy.pid)""".execute()
-	println("JocDynamicProxy: restarting haproxy")
-	["service", "haproxy", "restart"].execute().waitFor()
+	reload()
+}
+
+def reload(){
+	println("JocDynamicProxy: reloading haproxy")
+	["service", "haproxy", "reload"].execute().waitFor()
 }
 
 def getCliPort(url){
-	//TODO finish including restart
 	Process result = ["curl", "-I", "-s", "${url}"].execute() | ["grep", "-Fi", "X-Jenkins-CLI2-Port"].execute()
-	return result.text.minus("X-Jenkins-CLI2-Port: ")
+	return result.text ? result.text.minus("X-Jenkins-CLI2-Port: ") : null
 }
  
-def aclsFromClientMasters(clientMasters){
-	def acls = ""
-	clientMasters.each{
-		acls += acl(it.key, it.key)
+def acl(name, mode, jenkinsInstance){
+	def acl = ""
+	if(mode == "http"){
+		acl = """
+			acl ${jenkinsInstance.name}-req path_reg ^/${jenkinsInstance.name}*
+			use_backend ${jenkinsInstance.name}-${name} if ${jenkinsInstance.name}-req
+		"""
 	}
-	return acls
+	if(mode == "tcp" && jenkinsInstance.jnlpPort){
+		acl = """
+			acl ${jenkinsInstance.name}-req url_port ${jenkinsInstance.jnlpPort}
+			use_backend ${jenkinsInstance.name}-${name} if ${jenkinsInstance.name}-req
+		"""
+	}
+	return acl
 }
 
-def acl(name, prefix){
-	return """
-		acl jebc-${name}-req path_reg ^/${prefix}*
-		use_backend ${name}-http if jebc-${name}-req
-	"""
-}
-
-def backendsFromClientMasters(clientMasters){
+//TODO refactor me
+def backends(name, mode, jenkinsInstances){
 	def backends = ""
-	clientMasters.each{
-		backends += backend(it.key, '/' + it.key, it.value)
+	jenkinsInstances.each{
+		backends += backend(name, mode, it)
 	}
 	return backends
 }
 
-def backend(name, prefix, List servers){
+def backend(name, mode, jenkinsInstance){
 	def backend = """
-		backend ${name}-http
-    	balance                 roundrobin
-    	option                  httpchk HEAD ${prefix}/ha/health-check
+		backend ${jenkinsInstance.name}-${name}
+    		balance roundrobin
+    		mode ${mode}
     """
-    servers.eachWithIndex{ url, i ->
-		backend += "server ${name}-http-${i} ${url} check $NEWLINE"
+    if(mode == "http"){
+    	backend += "option httpchk HEAD /${jenkinsInstance.name}/ha/health-check $NEWLINE"
+    }
+    jenkinsInstance.servers.eachWithIndex{ url, i ->
+    	def server = url
+    	if(mode == "http"){
+			backend += "server ${jenkinsInstance.name}-${name}-${i} ${server} $NEWLINE"
+    	}else if(mode == "tcp" && jenkinsInstance.jnlpPort){
+			server = server.replace('8080', jenkinsInstance.jnlpPort)
+			backend += "server ${jenkinsInstance.name}-${name}-${i} ${server} $NEWLINE"
+		}
 	}
 	return backend
 }
 
-def template(acls, List servers){
-	def template = """
+def frontend(name, mode, jenkinsInstances){
+	def ports = jenkinsInstances.collect{ mode == 'http' ? it.httpPort : it.jnlpPort }.findAll()
+	def frontend = """
+		########### ${name} traffic #############
+		frontend ${name}
+			mode ${mode}
+	"""
+	ports.unique().each{
+		frontend += "bind *:${it} ${NEWLINE}"
+	}
+	jenkinsInstances.each{
+		frontend += acl(name, mode, it)
+	}
+	return frontend
+}
+
+def listen(name, mode, jenkinsInstances){
+	return frontend(name, mode, jenkinsInstances) + backends(name, mode, jenkinsInstances)
+}
+
+def template(jenkinsInstances){
+	return """
 	#---------------------------------------------------------------------
 	# Global settings
 	#---------------------------------------------------------------------
@@ -131,7 +170,6 @@ def template(acls, List servers){
 	    debug
 	    
 	defaults
-	    mode                    http
 	    log                     global
 	    option                  dontlognull
 	    option                  http-server-close
@@ -148,35 +186,14 @@ def template(acls, List servers){
 	    timeout http-keep-alive 10s
 	    timeout check           500
 	    default-server          inter 5s downinter 500 rise 1 fall 1
-
-	########### http traffic #############
-
-	frontend http
-	    bind                    *:80
-	    option                  httplog
-
 	"""
+}
 
-	template += acls
-	template += "default_backend joc-http"
-	template += backend('joc', "", servers)
-
-	template += """
-	########### jnlp traffic #############
-
-	frontend jnlp
-	    mode                    tcp
-	    option                  tcplog
-	    bind                    *:49187
-	    use_backend             joc-jnlp
-
-	backend joc-jnlp
-	    mode tcp
-	    balance                 roundrobin
-	    server                  joc-jnlp-1 joc-1.jenkins-operations-center.dev.beedemo.io:49187
-	    server                  joc-jnlp-2 joc-2.jenkins-operations-center.dev.beedemo.io:49187
-
-	"""
-
-	return template
+@EqualsAndHashCode
+class JenkinsInstance {
+	def name
+	def jenkinsHome
+	def httpPort
+	def jnlpPort
+	Set<String> servers
 }
