@@ -13,14 +13,27 @@ OLD_JENKINS_INSTANCES = [] as Set
 
 run(args)
 
-def run(servers){
-	if(servers == null){
-		throw new Exception("Enter JOC backends as Groovy args.")
-	}
-	JenkinsInstance joc = new JenkinsInstance(name: "joc", jenkinsHome: JENKINS_OC_HOME, servers: servers, httpPort: 80)
+def run(args){
+	def cli = new CliBuilder(usage: 'jocproxy.groovy -[hnd] [servers]')
+	cli.with {
+		h longOpt: 'help', 'Show usage information'
+        n longOpt: 'name', args: 1, argName: 'name', 'Name of JOC server (httpPrefix)'
+        d longOpt: 'delay', args: 1, argName: 'delay', 'Delay between polling interval in ms'
+    }
+    def options = cli.parse(args)
+
+    if (!options) {
+        return
+    }
+    if (options.h) {
+        cli.usage()
+        return
+    }
+
+	JenkinsInstance joc = new JenkinsInstance(name: options.n, jenkinsHome: JENKINS_OC_HOME, servers: options.arguments(), httpPort: 80)
 	while(true){
 		monitor(joc)
-		Thread.sleep(5000)
+		Thread.sleep(options.d ? options.d as int : 5000)
 		// new Timer().schedule({ monitor(joc) } as TimerTask, 1000, 5000)
 	}
 }
@@ -51,7 +64,7 @@ def monitor(JenkinsInstance joc){
 
 		// now determine jnlp ports
 		jenkinsInstances.each{
-			def port = getCliPort("http://localhost/" + it.name + "/") //TODO localhost?
+			def port = getCliPort("http://proxy.jenkins-haproxy.dev.beedemo.io/" + it.name + "/") //TODO localhost?
 			it.jnlpPort = port
 		}
 
@@ -77,12 +90,13 @@ def updateAndReload(jenkinsInstances){
 
 def reload(){
 	println("JocDynamicProxy: reloading haproxy")
-	["service", "haproxy", "reload"].execute().waitFor()
+	["service", "haproxy", "reload"].execute()
 }
 
 def getCliPort(url){
 	Process result = ["curl", "-I", "-s", "${url}"].execute() | ["grep", "-Fi", "X-Jenkins-CLI2-Port"].execute()
-	return result.text ? result.text.minus("X-Jenkins-CLI2-Port: ") : null
+	def header = result.text
+	return header ? header.minus("X-Jenkins-CLI2-Port: ") : null
 }
  
 def acl(name, mode, jenkinsInstance){
@@ -95,7 +109,7 @@ def acl(name, mode, jenkinsInstance){
 	}
 	if(mode == "tcp" && jenkinsInstance.jnlpPort){
 		acl = """
-			acl ${jenkinsInstance.name}-req url_port ${jenkinsInstance.jnlpPort}
+			acl ${jenkinsInstance.name}-req dst_port eq ${jenkinsInstance.jnlpPort}
 			use_backend ${jenkinsInstance.name}-${name} if ${jenkinsInstance.name}-req
 		"""
 	}
@@ -123,7 +137,7 @@ def backend(name, mode, jenkinsInstance){
     jenkinsInstance.servers.eachWithIndex{ url, i ->
     	def server = url
     	if(mode == "http"){
-			backend += "server ${jenkinsInstance.name}-${name}-${i} ${server} $NEWLINE"
+			backend += "server ${jenkinsInstance.name}-${name}-${i} ${server} check $NEWLINE"
     	}else if(mode == "tcp" && jenkinsInstance.jnlpPort){
 			server = server.replace('8080', jenkinsInstance.jnlpPort)
 			backend += "server ${jenkinsInstance.name}-${name}-${i} ${server} $NEWLINE"
@@ -138,6 +152,7 @@ def frontend(name, mode, jenkinsInstances){
 		########### ${name} traffic #############
 		frontend ${name}
 			mode ${mode}
+			option ${mode}log
 	"""
 	ports.unique().each{
 		frontend += "bind *:${it} ${NEWLINE}"
