@@ -1,16 +1,16 @@
 # Docker image for Jenkins Enterprise by CloudBees master
 
-FROM apemberton/jenkins-base
+FROM apemberton/jenkins-haproxy
 MAINTAINER Andy Pemberton <apemberton@cloudbees.com>
 
-# install haproxy
-# USER jenkins
-# WORKDIR /usr/lib/jenkins
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    haproxy \
-    rsyslog
+    groovy
 
-EXPOSE 80 49187
+EXPOSE 80
 
-CMD ["/bin/bash"]
+ADD /jocproxy.groovy /jocproxy.groovy
+
+# CMD ["groovy", "/jocproxy.groovy", "-p", "/operations-center"]
+
+ENTRYPOINT ["groovy", "/jocproxy.groovy"]
+CMD ["-p", "/operations-center"]
