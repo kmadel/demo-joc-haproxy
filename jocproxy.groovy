@@ -7,7 +7,7 @@ import groovy.transform.EqualsAndHashCode
 import groovy.transform.ToString
 
 NEWLINE = System.getProperty("line.separator")
-JENKINS_OC_HOME = "/data/var/lib/jenkins-oc"
+JENKINS_OC_HOME = "/mnt/var/lib/jenkins-oc"
 HA_PROXY_CFG = "/etc/haproxy/haproxy.cfg"
 PRIOR_JENKINS_INSTANCES = [] as Set
 
@@ -18,6 +18,7 @@ def run(args){
 	cli.with {
 		h longOpt: 'help', 'Show usage information'
         p longOpt: 'path', args: 1, argName: 'path', 'Path to JOC server (httpPrefix)'
+        j longOpt: 'joc-home', args: 1, argName: 'joc-home', 'JOC home directory'
         d longOpt: 'delay', args: 1, argName: 'delay', 'Delay between polling interval in ms'
     }
     def options = cli.parse(args)
@@ -32,7 +33,9 @@ def run(args){
 
     def name = options.p ? options.p.minus('/') : 'joc'
     def path = options.p ? options.p : ''
-	JenkinsInstance joc = new JenkinsInstance(name: name, path: path, jenkinsHome: JENKINS_OC_HOME, servers: options.arguments(), httpPort: 80)
+    def jocHome = options.j ? options.j : JENKINS_OC_HOME
+
+	JenkinsInstance joc = new JenkinsInstance(name: name, path: path, jenkinsHome: jocHome, servers: options.arguments(), httpPort: 80)
 	while(true){
 		monitor(joc)
 		Thread.sleep(options.d ? options.d as int : 5000)
