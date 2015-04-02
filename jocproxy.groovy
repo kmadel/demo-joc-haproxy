@@ -7,7 +7,7 @@ import groovy.transform.EqualsAndHashCode
 import groovy.transform.ToString
 
 NEWLINE = System.getProperty("line.separator")
-JENKINS_OC_HOME = "/mnt/var/lib/jenkins-oc"
+JENKINS_OC_HOME = "/data/var/lib/jenkins-oc"
 HA_PROXY_CFG = "/etc/haproxy/haproxy.cfg"
 PRIOR_JENKINS_INSTANCES = [] as Set
 
