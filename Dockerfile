@@ -12,5 +12,6 @@ ADD /jocproxy.groovy /jocproxy.groovy
 
 # CMD ["groovy", "/jocproxy.groovy", "-p", "/operations-center"]
 
-ENTRYPOINT ["groovy", "/jocproxy.groovy"]
-CMD ["-p", "/operations-center"]
+#ENTRYPOINT ["groovy", "/jocproxy.groovy"]
+#CMD ["-p", "/operations-center"]
+CMD ["groovy", "/jocproxy.groovy", "-p", "/operations-center"]
